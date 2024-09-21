@@ -2,7 +2,7 @@ package ginprometheus
 
 import (
 	"bytes"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -17,6 +17,7 @@ import (
 var defaultMetricPath = "/metrics"
 
 // Standard default metrics
+//
 //	counter, counter_vec, gauge, gauge_vec,
 //	histogram, histogram_vec, summary, summary_vec
 var reqCnt = &Metric{
@@ -24,7 +25,8 @@ var reqCnt = &Metric{
 	Name:        "requests_total",
 	Description: "How many HTTP requests processed, partitioned by status code and HTTP method.",
 	Type:        "counter_vec",
-	Args:        []string{"code", "method", "handler", "host", "url"}}
+	Args:        []string{"code", "method", "handler", "host", "url"},
+}
 
 var reqDur = &Metric{
 	ID:          "reqDur",
@@ -38,13 +40,15 @@ var resSz = &Metric{
 	ID:          "resSz",
 	Name:        "response_size_bytes",
 	Description: "The HTTP response sizes in bytes.",
-	Type:        "summary"}
+	Type:        "summary",
+}
 
 var reqSz = &Metric{
 	ID:          "reqSz",
 	Name:        "request_size_bytes",
 	Description: "The HTTP request sizes in bytes.",
-	Type:        "summary"}
+	Type:        "summary",
+}
 
 var standardMetrics = []*Metric{
 	reqCnt,
@@ -59,16 +63,16 @@ the cardinality of the request counter's "url" label, which might be required in
 For instance, if for a "/customer/:name" route you don't want to generate a time series for every
 possible customer name, you could use this function:
 
-func(c *gin.Context) string {
-	url := c.Request.URL.Path
-	for _, p := range c.Params {
-		if p.Key == "name" {
-			url = strings.Replace(url, p.Value, ":name", 1)
-			break
+	func(c *gin.Context) string {
+		url := c.Request.URL.Path
+		for _, p := range c.Params {
+			if p.Key == "name" {
+				url = strings.Replace(url, p.Value, ":name", 1)
+				break
+			}
 		}
+		return url
 	}
-	return url
-}
 
 which would map "/customer/alice" and "/customer/bob" to their template "/customer/:name".
 */
@@ -100,12 +104,12 @@ type Prometheus struct {
 	ReqCntURLLabelMappingFn RequestCounterURLLabelMappingFn
 
 	// gin.Context string to use as a prometheus URL label
-	URLLabelFromContext string
+	URLLabelFromContext  string
+	IgnoreNotFoundMetric bool
 }
 
 // PrometheusPushGateway contains the configuration for pushing to a Prometheus pushgateway (optional)
 type PrometheusPushGateway struct {
-
 	// Push interval in seconds
 	PushIntervalSeconds time.Duration
 
@@ -123,7 +127,6 @@ type PrometheusPushGateway struct {
 
 // NewPrometheus generates a new set of metrics with a certain subsystem name
 func NewPrometheus(subsystem string, customMetricsList ...[]*Metric) *Prometheus {
-
 	var metricsList []*Metric
 
 	if len(customMetricsList) > 1 {
@@ -183,7 +186,6 @@ func (p *Prometheus) SetListenAddressWithRouter(listenAddress string, r *gin.Eng
 
 // SetMetricsPath set metrics paths
 func (p *Prometheus) SetMetricsPath(e *gin.Engine) {
-
 	if p.listenAddress != "" {
 		p.router.GET(p.MetricsPath, prometheusHandler())
 		p.runServer()
@@ -194,14 +196,12 @@ func (p *Prometheus) SetMetricsPath(e *gin.Engine) {
 
 // SetMetricsPathWithAuth set metrics paths with authentication
 func (p *Prometheus) SetMetricsPathWithAuth(e *gin.Engine, accounts gin.Accounts) {
-
 	if p.listenAddress != "" {
 		p.router.GET(p.MetricsPath, gin.BasicAuth(accounts), prometheusHandler())
 		p.runServer()
 	} else {
 		e.GET(p.MetricsPath, gin.BasicAuth(accounts), prometheusHandler())
 	}
-
 }
 
 func (p *Prometheus) runServer() {
@@ -214,7 +214,7 @@ func (p *Prometheus) getMetrics() []byte {
 	response, _ := http.Get(p.Ppg.MetricsURL)
 
 	defer response.Body.Close()
-	body, _ := ioutil.ReadAll(response.Body)
+	body, _ := io.ReadAll(response.Body)
 
 	return body
 }
@@ -321,7 +321,6 @@ func NewMetric(m *Metric, subsystem string) prometheus.Collector {
 }
 
 func (p *Prometheus) registerMetrics(subsystem string) {
-
 	for _, metricDef := range p.MetricsList {
 		metric := NewMetric(metricDef, subsystem)
 		if err := prometheus.Register(metric); err != nil {
@@ -365,6 +364,14 @@ func (p *Prometheus) HandlerFunc() gin.HandlerFunc {
 		reqSz := computeApproximateRequestSize(c.Request)
 
 		c.Next()
+
+		if p.IgnoreNotFoundMetric {
+			status := c.Writer.Status()
+			// handle 404 and 405 error
+			if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
+				return
+			}
+		}
 
 		status := strconv.Itoa(c.Writer.Status())
 		elapsed := float64(time.Since(start)) / float64(time.Second)
